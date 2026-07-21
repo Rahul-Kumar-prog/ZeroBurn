@@ -43,11 +43,31 @@ export default function AwsSetup() {
   const navigate = useNavigate()
   const [accountId, setAccountId] = useState("")
 
-  const cfnUrl =
-    `https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review` +
-    `?templateURL=https://zeroburn-cfn.s3.amazonaws.com/zeroburn-role.yaml` +
-    `&stackName=ZeroburnRole` +
-    (accountId ? `&param_AccountId=${accountId}` : "")
+
+
+  const handleGrantPermissions = async () => {
+    if (accountId.length !== 12) return
+
+    try {
+      const response = await fetch("http://localhost:8000/api/aws/connect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ account_id: accountId }),
+      })
+      const data = await response.json()
+      console.log("Backend response:", data)
+    } catch (err) {
+      console.error("Failed to connect account:", err)
+    }
+  }
+
+  // const cfnUrl =
+  //   `https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review` +
+  //   `?templateURL=https://zeroburn-cfn.s3.amazonaws.com/zeroburn-role.yaml` +
+  //   `&stackName=ZeroburnRole` +
+  //   (accountId ? `&param_AccountId=${accountId}` : "")
 
   return (
     <div className="flex min-h-screen flex-col bg-[#0e0e10]">
@@ -96,9 +116,12 @@ export default function AwsSetup() {
           <div className="mb-8">
             <p className="mb-2 text-sm font-semibold text-white">AWS Account ID</p>
             <Input
-              type="number"
+              type="text"
               value={accountId}
-              onChange={(e) => setAccountId(e.target.value)}
+              onChange={(e) => {
+                const value = e.target.value.replace(/\D/g, "").slice(0,12)
+                setAccountId(value)
+              }}
               placeholder="123456789012"
               maxLength={12}
               className="h-11 w-72 rounded-lg border-[#2e2e35] bg-[#0e0e10] text-white placeholder:text-[#4a4a55] focus-visible:ring-1 focus-visible:ring-[#4752c4]"
@@ -117,16 +140,17 @@ export default function AwsSetup() {
 
             {/* Grant permissions link */}
             <a
-              href={cfnUrl}
+              // href={cfnUrl}
               target="_blank"
               rel="noopener noreferrer"
+              onClick={handleGrantPermissions}
               className={cn(
                 "mb-3 inline-flex items-center gap-2 rounded-lg border border-[#2e2e35] bg-[#1e1e24] px-4 py-2.5 text-sm text-[#9a9aaa] transition-colors",
                 accountId.length === 12
                   ? "hover:border-[#4752c4] hover:text-white cursor-pointer"
                   : "opacity-40 cursor-not-allowed pointer-events-none"
               )}
-              onClick={(e) => accountId.length !== 12 && e.preventDefault()}
+              // onClick={(e) => accountId.length !== 12 && e.preventDefault()}
             >
               <AwsBadge />
               Grant permissions
