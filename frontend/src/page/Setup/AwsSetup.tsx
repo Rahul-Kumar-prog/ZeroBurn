@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect, useRef } from "react"
 import { useNavigate } from "react-router-dom"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -19,9 +19,11 @@ function AwsBadge({ className }: { className?: string }) {
   )
 }
 
+type ConnectionStatus = "idle" | "checking" | "connected" | "not_found"
+
 // ── Status banner ─────────────────────────────────────────────────────────────
-function StatusBanner({ accountId }: { accountId: string }) {
-  if (!accountId.trim()) {
+function StatusBanner({ status, accountId }: { status: ConnectionStatus; accountId: string }) {
+  if (!accountId.trim() || status === "idle") {
     return (
       <div className="flex items-center rounded-lg bg-[#1e1e24] px-4 py-3">
         <span className="text-sm text-[#6b6b7b]">
@@ -30,10 +32,29 @@ function StatusBanner({ accountId }: { accountId: string }) {
       </div>
     )
   }
+  if (status === "checking") {
+    return (
+      <div className="flex items-center gap-2 rounded-lg bg-[#1e1e24] px-4 py-3">
+        <span className="h-2 w-2 rounded-full bg-yellow-400 animate-pulse" />
+        <span className="text-sm text-[#9a9aaa]">Checking connection status…</span>
+      </div>
+    )
+  }
+  if (status === "connected") {
+    return (
+      <div className="flex items-center gap-2 rounded-lg bg-[#1e1e24] px-4 py-3">
+        <span className="h-2 w-2 rounded-full bg-green-400" />
+        <span className="text-sm text-green-400">Account connected successfully</span>
+      </div>
+    )
+  }
+  // not_found — role missing, user needs to grant permissions
   return (
     <div className="flex items-center gap-2 rounded-lg bg-[#1e1e24] px-4 py-3">
-      <span className="h-2 w-2 rounded-full bg-yellow-400 animate-pulse" />
-      <span className="text-sm text-[#9a9aaa]">Checking connection status…</span>
+      <span className="h-2 w-2 rounded-full bg-orange-400" />
+      <span className="text-sm text-[#9a9aaa]">
+        Permissions not found — click Grant permissions to set up access
+      </span>
     </div>
   )
 }
@@ -42,32 +63,118 @@ function StatusBanner({ accountId }: { accountId: string }) {
 export default function AwsSetup() {
   const navigate = useNavigate()
   const [accountId, setAccountId] = useState("")
+  const [cfnUrl, setCfnUrl] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [isCheckingInitial, setIsCheckingInitial] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("idle")
+  const [grantedOnce, setGrantedOnce] = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  // ── On every valid 12-digit account ID, do a single status check ─────────
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
 
+    if (accountId.length !== 12) {
+      setConnectionStatus("idle")
+      setCfnUrl(null)
+      setGrantedOnce(false)
+      return
+    }
 
-  const handleGrantPermissions = async () => {
+    debounceRef.current = setTimeout(async () => {
+      setIsCheckingInitial(true)
+      setConnectionStatus("checking")
+      try {
+        const res = await fetch(
+          `${import.meta.env.VITE_API_BASE_URL}/api/aws/status?account_id=${accountId}`
+        )
+        const data = await res.json()
+        setConnectionStatus(data.status === "connected" ? "connected" : "not_found")
+      } catch {
+        setConnectionStatus("not_found")
+      } finally {
+        setIsCheckingInitial(false)
+      }
+    }, 400)
+
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
+  }, [accountId])
+
+  // ── Once user has opened the CFN URL, start polling every 10s ────────────
+  useEffect(() => {
+    if (!grantedOnce || connectionStatus === "connected") return
+
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `${import.meta.env.VITE_API_BASE_URL}/api/aws/status?account_id=${accountId}`
+        )
+        const data = await res.json()
+        if (data.status === "connected") {
+          setConnectionStatus("connected")
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+        }
+      } catch { /* network hiccup — keep polling */ }
+    }
+
+    poll()
+    pollRef.current = setInterval(poll, 10_000)
+    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null } }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [grantedOnce])
+
+  const handleGrantPermissions = async (e: React.MouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault()
     if (accountId.length !== 12) return
 
+    // Re-open cached URL if we already fetched it
+    if (cfnUrl) {
+      window.open(cfnUrl, "_blank", "noopener,noreferrer")
+      return
+    }
+
+    setIsLoading(true)
+    setError(null)
+
     try {
-      const response = await fetch("http://localhost:8000/api/aws/connect", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ account_id: accountId }),
-      })
-      const data = await response.json()
-      console.log("Backend response:", data)
+      const response = await fetch(
+        `${import.meta.env.VITE_API_BASE_URL}/api/aws/connect`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ account_id: accountId }),
+        }
+      )
+      const text = await response.text()
+      const data = text ? JSON.parse(text) : {}
+
+      if (!response.ok) throw new Error(data.error ?? "Failed to generate CloudFormation URL")
+      if (!data.cfn_url) throw new Error("No CloudFormation URL returned from server")
+
+      setCfnUrl(data.cfn_url)
+      setGrantedOnce(true)
+      window.open(data.cfn_url, "_blank", "noopener,noreferrer")
     } catch (err) {
-      console.error("Failed to connect account:", err)
+      if (err instanceof TypeError && err.message.toLowerCase().includes("fetch")) {
+        setError("Cannot reach the server — make sure the backend is running on port 8003")
+      } else {
+        setError(err instanceof Error ? err.message : "Something went wrong")
+      }
+    } finally {
+      setIsLoading(false)
     }
   }
 
-  // const cfnUrl =
-  //   `https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review` +
-  //   `?templateURL=https://zeroburn-cfn.s3.amazonaws.com/zeroburn-role.yaml` +
-  //   `&stackName=ZeroburnRole` +
-  //   (accountId ? `&param_AccountId=${accountId}` : "")
+  const alreadyConnected = connectionStatus === "connected"
+  // Show the Grant button only while not yet connected and initial check is done
+  const showGrantButton = accountId.length === 12 && !isCheckingInitial && !alreadyConnected
+
+  // Status banner message changes once the user has opened the CFN URL
+  const bannerStatus: ConnectionStatus =
+    connectionStatus === "not_found" && grantedOnce ? "checking" : connectionStatus
 
   return (
     <div className="flex min-h-screen flex-col bg-[#0e0e10]">
@@ -87,9 +194,7 @@ export default function AwsSetup() {
               </svg>
               Back
             </button>
-
             <span className="text-[#2a2a30]">|</span>
-
             <div className="flex items-center gap-2">
               <AwsBadge />
               <span className="text-sm font-semibold text-white">Grant AWS permissions</span>
@@ -118,10 +223,7 @@ export default function AwsSetup() {
             <Input
               type="text"
               value={accountId}
-              onChange={(e) => {
-                const value = e.target.value.replace(/\D/g, "").slice(0,12)
-                setAccountId(value)
-              }}
+              onChange={(e) => setAccountId(e.target.value.replace(/\D/g, "").slice(0, 12))}
               placeholder="123456789012"
               maxLength={12}
               className="h-11 w-72 rounded-lg border-[#2e2e35] bg-[#0e0e10] text-white placeholder:text-[#4a4a55] focus-visible:ring-1 focus-visible:ring-[#4752c4]"
@@ -138,29 +240,32 @@ export default function AwsSetup() {
               the infrastructure in your account.
             </p>
 
-            {/* Grant permissions link */}
-            <a
-              // href={cfnUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={handleGrantPermissions}
-              className={cn(
-                "mb-3 inline-flex items-center gap-2 rounded-lg border border-[#2e2e35] bg-[#1e1e24] px-4 py-2.5 text-sm text-[#9a9aaa] transition-colors",
-                accountId.length === 12
-                  ? "hover:border-[#4752c4] hover:text-white cursor-pointer"
-                  : "opacity-40 cursor-not-allowed pointer-events-none"
-              )}
-              // onClick={(e) => accountId.length !== 12 && e.preventDefault()}
-            >
-              <AwsBadge />
-              Grant permissions
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-              </svg>
-            </a>
+            {/* Grant permissions button — hidden once connected */}
+            {showGrantButton && (
+              <a
+                href={cfnUrl ?? undefined}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={handleGrantPermissions}
+                className={cn(
+                  "mb-3 inline-flex items-center gap-2 rounded-lg border border-[#2e2e35] bg-[#1e1e24] px-4 py-2.5 text-sm text-[#9a9aaa] transition-colors",
+                  !isLoading
+                    ? "hover:border-[#4752c4] hover:text-white cursor-pointer"
+                    : "opacity-60 cursor-not-allowed pointer-events-none"
+                )}
+              >
+                <AwsBadge />
+                {isLoading ? "Opening…" : "Grant permissions"}
+                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+              </a>
+            )}
 
-            {/* Connection status */}
-            <StatusBanner accountId={accountId} />
+            {error && <p className="mb-3 text-xs text-red-400">{error}</p>}
+
+            {/* Connection status banner */}
+            <StatusBanner status={bannerStatus} accountId={accountId} />
           </div>
 
           {/* ── Step 3: Complete setup ── */}
@@ -170,17 +275,26 @@ export default function AwsSetup() {
               Wait for Zeroburn to create roles and policies to access your account. This can take
               up to 10 minutes.
             </p>
-
             <div className="flex items-center rounded-lg bg-[#1e1e24] px-4 py-3">
-              <span className="text-sm text-[#6b6b7b]">Waiting for account to be connected</span>
+              {alreadyConnected ? (
+                <span className="text-sm text-green-400">Account connected — ready to continue</span>
+              ) : (
+                <span className="text-sm text-[#6b6b7b]">Waiting for account to be connected</span>
+              )}
             </div>
           </div>
 
-          {/* Continue — bottom right */}
+          {/* Continue */}
           <div className="mt-8 flex justify-end">
             <Button
-              disabled={accountId.length !== 12}
-              className="h-10 rounded-lg bg-[#2e2e35] px-6 text-sm font-medium text-[#8a8a9a] hover:bg-[#3c3c45] disabled:opacity-50"
+              disabled={!alreadyConnected}
+              onClick={() => alreadyConnected && navigate("/dashboard")}
+              className={cn(
+                "h-10 rounded-lg px-6 text-sm font-medium transition-colors",
+                alreadyConnected
+                  ? "bg-[#4752c4] text-white hover:bg-[#3c45a5] cursor-pointer"
+                  : "bg-[#2e2e35] text-[#8a8a9a] cursor-not-allowed opacity-50"
+              )}
             >
               Continue
             </Button>
@@ -191,24 +305,14 @@ export default function AwsSetup() {
 
       {/* ── Footer step bar ── */}
       <div className="flex items-center justify-between border-t border-[#1e1e24] px-8 py-4">
-
-        {/* Step indicator */}
         <div className="flex items-center gap-3">
           <span className="text-sm text-[#8a8a9a]">Step 3 of 5</span>
           <div className="flex gap-1">
             {[0, 1, 2, 3, 4].map((i) => (
-              <div
-                key={i}
-                className={cn(
-                  "h-1 rounded-full",
-                  i < 3 ? "w-8 bg-white" : "w-8 bg-[#2e2e35]"
-                )}
-              />
+              <div key={i} className={cn("h-1 rounded-full", i < 3 ? "w-8 bg-white" : "w-8 bg-[#2e2e35]")} />
             ))}
           </div>
         </div>
-
-        {/* Footer links */}
         <div className="flex items-center gap-6">
           <button className="flex items-center gap-1.5 text-sm text-[#8a8a9a] hover:text-white transition-colors">
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -227,8 +331,8 @@ export default function AwsSetup() {
             </svg>
           </button>
         </div>
-
       </div>
+
     </div>
   )
 }
